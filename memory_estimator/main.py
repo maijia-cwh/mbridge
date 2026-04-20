@@ -26,6 +26,7 @@ SUPPORTED_MODELS = [
     "Qwen/Qwen2.5-72B",
     "moonshotai/Moonlight-16B-A3B",
     "moonshotai/Kimi-K2-Instruct",
+    "moonshotai/Kimi-K2.5",
     "deepseek-ai/DeepSeek-V3",
     "XiaomiMiMo/MiMo-7B-RL",
 ]
@@ -128,7 +129,26 @@ async def estimate_with_mbridge(config: MBridgeEstimateConfig):
     #         ("http", "./", "../")
     # ):
     #     hf_model_path = os.path.join("/dev/shm", hf_model_path)
-    bridge = AutoBridge.from_pretrained(hf_model_path)
+    # 对于多模态模型（如 Kimi-K2.5），使用 text_config 子配置
+    hf_config_path = os.path.join(hf_model_path, "config.json") if os.path.isdir(hf_model_path) else None
+    if hf_config_path and os.path.exists(hf_config_path):
+        with open(hf_config_path) as f:
+            raw_config = json.load(f)
+        if "text_config" in raw_config:
+            # 多模态模型：提取 text_config 作为独立配置
+            text_cfg = raw_config["text_config"]
+            # 映射未注册的 model_type 到已注册的 bridge
+            model_type_map = {"kimi_k2": "deepseek_v3"}
+            if text_cfg.get("model_type") in model_type_map:
+                text_cfg["model_type"] = model_type_map[text_cfg["model_type"]]
+            # 移除 auto_map 避免加载自定义代码
+            text_cfg.pop("auto_map", None)
+            tmp_dir = tempfile.mkdtemp(prefix="mem_est_")
+            with open(os.path.join(tmp_dir, "config.json"), "w") as f:
+                json.dump(text_cfg, f)
+            hf_model_path = tmp_dir
+
+    bridge = AutoBridge.from_pretrained(hf_model_path, trust_remote_code=True)
     tf_config = bridge.config
     hf_config = bridge.hf_config
 
@@ -163,12 +183,13 @@ async def estimate_with_mbridge(config: MBridgeEstimateConfig):
         )
 
     if config.pipeline_model_parallel_layout:
-        from megatron.core.transformer.pipeline_parallel_layer_layout import (
-            PipelineParallelLayerLayout,
+        # 数值型 layout（如 "10,13,13,13,12"）：提取首尾 stage 层数
+        layer_counts = [int(x.strip()) for x in config.pipeline_model_parallel_layout.split(",")]
+        assert len(layer_counts) == config.pp, (
+            f"pp-layout 长度 ({len(layer_counts)}) 必须等于 PP ({config.pp})"
         )
-        tf_config.pipeline_model_parallel_layout = PipelineParallelLayerLayout(
-            config.pipeline_model_parallel_layout, config.pp
-        )
+        tf_config.num_layers_in_first_pipeline_stage = layer_counts[0]
+        tf_config.num_layers_in_last_pipeline_stage = layer_counts[-1]
 
     # 创建 args 对象
     args = argparse.Namespace()

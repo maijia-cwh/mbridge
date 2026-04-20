@@ -647,6 +647,49 @@ class TEGroupedMLP(MemEstimator):
         return input_shape
 
 
+class GroupedMLP(MemEstimator):
+    """Legacy GroupedMLP — same memory footprint as TEGroupedMLP but doesn't require submodules."""
+
+    def __init__(self, num_local_experts, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.num_local_experts = num_local_experts
+        self.input_size = self.config.hidden_size
+
+        ffn_hidden_size = self.config.moe_ffn_hidden_size
+        if self.config.gated_linear_unit:
+            ffn_hidden_size *= 2
+
+        # weight1: [num_experts, input_size, ffn_hidden_size]
+        self.weight1_numel = self.num_local_experts * self.input_size * ffn_hidden_size
+        # weight2: [num_experts, ffn_hidden_size/2, input_size] (after glu split)
+        actual_ffn = ffn_hidden_size // 2 if self.config.gated_linear_unit else ffn_hidden_size
+        self.weight2_numel = self.num_local_experts * actual_ffn * self.input_size
+
+        self.activation_recompute = (
+            self.config.recompute_granularity == "selective"
+            and "moe_act" in self.config.recompute_modules
+        )
+
+    def num_parameter(self):
+        return self.weight1_numel + self.weight2_numel
+
+    def num_activation(self, input_shape: list[int], tokens_per_expert=None):
+        ret = 0
+        if not self.activation_recompute:
+            # fc1 output
+            ffn_hidden_size = self.config.moe_ffn_hidden_size
+            if self.config.gated_linear_unit:
+                ffn_hidden_size *= 2
+            ret += input_shape[0] * input_shape[1] * ffn_hidden_size // self.num_local_experts
+            # activation (swiglu)
+            ret += input_shape[0] * input_shape[1] * (ffn_hidden_size // 2) // self.num_local_experts
+        return ret
+
+    def mock_forward(self, input_shape: list[int], tokens_per_expert=None):
+        return input_shape
+
+
 class TEGroupedLinear(MemEstimator):
     def __init__(
         self,
