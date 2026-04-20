@@ -131,7 +131,7 @@ def _get_transformer_layer_spec(use_te, config):
 def model_provider(
     args, config, pre_process=True, post_process=True, vp_stage: Optional[int] = None
 ) -> GPTModel:
-    use_te = True
+    use_te = False
     if args.num_experts:
         # Define the decoder block spec
         transformer_layer_spec = get_gpt_decoder_block_spec(

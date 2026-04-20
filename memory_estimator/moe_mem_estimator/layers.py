@@ -330,6 +330,18 @@ class RMSNorm(MemEstimator):
     def num_parameter(self):
         return self.weight
 
+
+class WrappedTorchNorm(MemEstimator):
+    """Fallback norm estimator when Apex is not installed."""
+    def __init__(self, config=None, hidden_size: int = 0, *args, **kwargs):
+        super().__init__()
+        if isinstance(config, int):
+            hidden_size = config
+        self.weight = hidden_size
+
+    def num_parameter(self):
+        return self.weight
+
     def num_activation(self, input_shape: list[int]):
         return cum_mul(input_shape[:])
 
@@ -1593,8 +1605,15 @@ def build_module(
     if hasattr(spec_or_module, "submodules") and spec_or_module.submodules is not None:
         kwargs["submodules"] = spec_or_module.submodules
 
+    # Fallback mapping for when TE/Apex are not installed
+    _FALLBACK_MAP = {
+        "DotProductAttention": "TEDotProductAttention",
+    }
+
     try:
-        module = globals()[module.__name__]
+        name = module.__name__
+        name = _FALLBACK_MAP.get(name, name)
+        module = globals()[name]
         return module(
             *args,
             **spec_or_module.params if hasattr(spec_or_module, "params") else {},
