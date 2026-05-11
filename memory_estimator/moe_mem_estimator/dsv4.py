@@ -1180,7 +1180,10 @@ class DSV4Model(MemEstimator):
 
         if layer_acts:
             self._num_act_per_layer = layer_acts[0] if layer_acts else 0
-            self._num_act_between_layers = layer_acts[0] if layer_acts else 0
+            # Between-layer activation: only the hidden state tensor that must be
+            # saved for recomputation during backward (not the full layer activation)
+            from moe_mem_estimator.base import cum_mul
+            self._num_act_between_layers = cum_mul(current_shape)
 
         # Final norm + output head
         if self.final_norm is not None:
