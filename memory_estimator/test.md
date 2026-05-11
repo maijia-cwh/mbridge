@@ -48,4 +48,22 @@
     --pp-layout '10,13,13,13,12' \      
     --recompute full --recompute-method uniform --recompute-num-layers 1
     
+  # 完全自定义 PP layout + full recompute + cp + seq_len  
+  bash memory_estimator/start.sh cli \
+      --model memory_estimator/config/kimi-K2.5 \
+      --num-gpus 640 --tp 8 --pp 5 --ep 128 --etp 1 --cp 16 \
+      --pp-layout '10,13,13,13,12' \
+      --recompute full --recompute-method uniform --recompute-num-layers 1 --seq-len 131072 --mbs 1  
+
+  # DeepSeek-V4 (CSA/HCA attention + Hyper-Connection + MoE hash routing)
+  bash memory_estimator/start.sh cli \
+      --model memory_estimator/config/DeepSeek-V4 \
+      --num-gpus 512 --tp 8 --pp 1 --ep 8 --cp 8 \
+      --seq-len 131072 --mbs 1
+    
+  # DeepSeek-V4 (CSA/HCA attention + Hyper-Connection + MoE hash routing) 
+  bash memory_estimator/start.sh cli \
+      --model memory_estimator/config/DeepSeek-V4 \
+      --num-gpus 512 --tp 8 --pp 4 --ep 128 --cp 16 --pp-layout '10,11,11,11'  \   
+      --seq-len 131072 --mbs 1 --recompute full --recompute-method uniform --recompute-num-layers 1   
 ```

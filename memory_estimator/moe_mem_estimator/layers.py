@@ -648,7 +648,13 @@ class TEGroupedMLP(MemEstimator):
 
 
 class GroupedMLP(MemEstimator):
-    """Legacy GroupedMLP — same memory footprint as TEGroupedMLP but doesn't require submodules."""
+    """Legacy GroupedMLP — same memory footprint as TEGroupedMLP but doesn't require submodules.
+
+    Mirrors TEGroupedMLP parameter layout: fc1 is column-parallel and fc2 is
+    row-parallel over the Expert Tensor Parallel (ETP) dimension, so the
+    ffn_hidden_size is divided by ETP just like TEColumnParallelGroupedLinear /
+    TERowParallelGroupedLinear would do.
+    """
 
     def __init__(self, num_local_experts, config: TransformerConfig):
         super().__init__()
@@ -656,15 +662,24 @@ class GroupedMLP(MemEstimator):
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
 
+        etp_size = get_expert_tensor_parallel_world_size()
+
         ffn_hidden_size = self.config.moe_ffn_hidden_size
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
-        # weight1: [num_experts, input_size, ffn_hidden_size]
-        self.weight1_numel = self.num_local_experts * self.input_size * ffn_hidden_size
-        # weight2: [num_experts, ffn_hidden_size/2, input_size] (after glu split)
+        # fc1 (column parallel): output dim split by ETP
+        fc1_output_size = divide(ffn_hidden_size, etp_size)
+        self.weight1_numel = self.num_local_experts * self.input_size * fc1_output_size
+
+        # fc2 (row parallel): input dim split by ETP
         actual_ffn = ffn_hidden_size // 2 if self.config.gated_linear_unit else ffn_hidden_size
-        self.weight2_numel = self.num_local_experts * actual_ffn * self.input_size
+        fc2_input_size = divide(actual_ffn, etp_size)
+        self.weight2_numel = self.num_local_experts * fc2_input_size * self.input_size
+
+        # For activation/mock_forward
+        self.fc1_output_size = fc1_output_size
+        self.fc2_input_size = fc2_input_size
 
         self.activation_recompute = (
             self.config.recompute_granularity == "selective"
@@ -678,12 +693,9 @@ class GroupedMLP(MemEstimator):
         ret = 0
         if not self.activation_recompute:
             # fc1 output
-            ffn_hidden_size = self.config.moe_ffn_hidden_size
-            if self.config.gated_linear_unit:
-                ffn_hidden_size *= 2
-            ret += input_shape[0] * input_shape[1] * ffn_hidden_size // self.num_local_experts
+            ret += input_shape[0] * input_shape[1] * self.fc1_output_size // self.num_local_experts
             # activation (swiglu)
-            ret += input_shape[0] * input_shape[1] * (ffn_hidden_size // 2) // self.num_local_experts
+            ret += input_shape[0] * input_shape[1] * self.fc2_input_size // self.num_local_experts
         return ret
 
     def mock_forward(self, input_shape: list[int], tokens_per_expert=None):

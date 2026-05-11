@@ -28,8 +28,12 @@ SUPPORTED_MODELS = [
     "moonshotai/Kimi-K2-Instruct",
     "moonshotai/Kimi-K2.5",
     "deepseek-ai/DeepSeek-V3",
+    "deepseek-ai/DeepSeek-V4",
     "XiaomiMiMo/MiMo-7B-RL",
 ]
+
+# Model types that use the V4 estimation path (bypasses mbridge)
+V4_MODEL_TYPES = {"deepseek_v4"}
 
 
 
@@ -124,28 +128,79 @@ async def estimate_with_mbridge(config: MBridgeEstimateConfig):
 
     hf_model_path = config.hf_model_path
 
+    # --- DeepSeek-V4 路由：使用独立估算路径，跳过 mbridge ---
+    hf_config_path = os.path.join(hf_model_path, "config.json") if os.path.isdir(hf_model_path) else None
+    if hf_config_path and os.path.exists(hf_config_path):
+        with open(hf_config_path) as f:
+            _raw_config = json.load(f)
+        _cfg_check = _raw_config.get("text_config", _raw_config) if "text_config" in _raw_config else _raw_config
+        if _cfg_check.get("model_type") in V4_MODEL_TYPES:
+            from estimate_v4 import estimate_v4_from_hf_config
+            aggregated_reports, raw_reports = estimate_v4_from_hf_config(
+                hf_config_path,
+                num_gpus=config.num_gpus,
+                tp=config.tp,
+                pp=config.pp,
+                ep=config.ep,
+                cp=config.cp,
+                etp=config.etp if config.etp else 1,
+                mbs=config.mbs,
+                seq_len=config.seq_len,
+                use_distributed_optimizer=config.use_distributed_optimizer,
+                recompute_granularity=config.recompute_granularity,
+                recompute_method=config.recompute_method,
+                recompute_num_layers=config.recompute_num_layers or 1,
+                recompute_modules=config.recompute_modules or [],
+                num_layers_in_first_pipeline_stage=config.num_layers_in_first_pipeline_stage,
+                num_layers_in_last_pipeline_stage=config.num_layers_in_last_pipeline_stage,
+            )
+            processed_reports = []
+            for rpt in aggregated_reports:
+                p = rpt.copy()
+                p.pop("attention_types", None)
+                processed_reports.append(p)
+            return {"processed_reports": processed_reports, "raw_chunk_reports": raw_reports}
+
 
     # if not os.path.isabs(hf_model_path) and not hf_model_path.startswith(
     #         ("http", "./", "../")
     # ):
     #     hf_model_path = os.path.join("/dev/shm", hf_model_path)
     # 对于多模态模型（如 Kimi-K2.5），使用 text_config 子配置
+    # 对于引用自定义代码的本地配置，清理 auto_map 避免加载缺失文件
     hf_config_path = os.path.join(hf_model_path, "config.json") if os.path.isdir(hf_model_path) else None
     if hf_config_path and os.path.exists(hf_config_path):
         with open(hf_config_path) as f:
             raw_config = json.load(f)
+
+        cfg_to_use = raw_config
         if "text_config" in raw_config:
             # 多模态模型：提取 text_config 作为独立配置
-            text_cfg = raw_config["text_config"]
-            # 映射未注册的 model_type 到已注册的 bridge
-            model_type_map = {"kimi_k2": "deepseek_v3"}
-            if text_cfg.get("model_type") in model_type_map:
-                text_cfg["model_type"] = model_type_map[text_cfg["model_type"]]
-            # 移除 auto_map 避免加载自定义代码
-            text_cfg.pop("auto_map", None)
+            cfg_to_use = raw_config["text_config"]
+
+        # 映射未注册的 model_type 到已注册的 bridge
+        model_type_map = {"kimi_k2": "deepseek_v3"}
+        if cfg_to_use.get("model_type") in model_type_map:
+            cfg_to_use["model_type"] = model_type_map[cfg_to_use["model_type"]]
+
+        # 检查 auto_map 引用的自定义代码文件是否存在，不存在则移除
+        if "auto_map" in cfg_to_use:
+            needs_rewrite = False
+            for key, val in cfg_to_use["auto_map"].items():
+                module_file = val.split(".")[0] + ".py"
+                if not os.path.exists(os.path.join(hf_model_path, module_file)):
+                    needs_rewrite = True
+                    break
+            if needs_rewrite or cfg_to_use is not raw_config:
+                cfg_to_use.pop("auto_map", None)
+                tmp_dir = tempfile.mkdtemp(prefix="mem_est_")
+                with open(os.path.join(tmp_dir, "config.json"), "w") as f:
+                    json.dump(cfg_to_use, f)
+                hf_model_path = tmp_dir
+        elif cfg_to_use is not raw_config:
             tmp_dir = tempfile.mkdtemp(prefix="mem_est_")
             with open(os.path.join(tmp_dir, "config.json"), "w") as f:
-                json.dump(text_cfg, f)
+                json.dump(cfg_to_use, f)
             hf_model_path = tmp_dir
 
     bridge = AutoBridge.from_pretrained(hf_model_path, trust_remote_code=True)
