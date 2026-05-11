@@ -269,6 +269,8 @@ def estimate_v4_from_hf_config(
     recompute_modules: Optional[list] = None,
     num_layers_in_first_pipeline_stage: Optional[int] = None,
     num_layers_in_last_pipeline_stage: Optional[int] = None,
+    no_1f1b: bool = False,
+    unfused_attn: bool = False,
 ):
     """Estimate V4 memory from a HuggingFace config.json path.
 
@@ -319,6 +321,7 @@ def estimate_v4_from_hf_config(
         recompute_modules=recompute_modules or [],
         num_layers_in_first_pipeline_stage=num_layers_in_first_pipeline_stage,
         num_layers_in_last_pipeline_stage=num_layers_in_last_pipeline_stage,
+        unfused_attn=unfused_attn,
     )
 
     return estimate_v4_from_config(v4_config)

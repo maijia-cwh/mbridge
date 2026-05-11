@@ -67,6 +67,8 @@ run_cli() {
     local pp_layout="None"
     local account_embedding="False"
     local account_loss="False"
+    local no_1f1b="False"
+    local unfused_attn="False"
 
     # 解析命名参数
     while [[ $# -gt 0 ]]; do
@@ -91,6 +93,8 @@ run_cli() {
             --pp-layout)        pp_layout="$2"; shift 2 ;;
             --account-embedding) account_embedding="True"; shift ;;
             --account-loss)     account_loss="True"; shift ;;
+            --no-1f1b)          no_1f1b="True"; shift ;;
+            --unfused-attn)     unfused_attn="True"; shift ;;
             *)                  echo "未知参数: $1"; exit 1 ;;
         esac
     done
@@ -145,6 +149,8 @@ config = MBridgeEstimateConfig(
     pipeline_model_parallel_layout=${pp_layout_arg},
     account_for_embedding_in_pipeline_split=${account_embedding},
     account_for_loss_in_pipeline_split=${account_loss},
+    no_1f1b=${no_1f1b},
+    unfused_attn=${unfused_attn},
 )
 result = asyncio.run(estimate_with_mbridge(config))
 print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -189,6 +195,12 @@ usage() {
     echo "  --recompute-method <m>  重计算方法: uniform|block (默认: uniform)"
     echo "  --recompute-num-layers <N>  重计算层数 (默认: 1)"
     echo "  --recompute-modules <m> 选择性重计算模块, 逗号分隔 (如: 'mlp,attention')"
+    echo ""
+    echo " Pipeline 调度:"
+    echo "  --no-1f1b               禁用 1F1B 调度，使用全 forward-first (各 rank 激活均衡)"
+    echo ""
+    echo " 算子模式:"
+    echo "  --unfused-attn          小算子模式: 计算注意力 logits/softmax 等中间张量显存"
     echo ""
     echo "示例:"
     echo "  $0 webui"

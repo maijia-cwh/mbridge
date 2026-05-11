@@ -112,6 +112,10 @@ class DSV4Config:
     num_layers_in_first_pipeline_stage: Optional[int] = None
     num_layers_in_last_pipeline_stage: Optional[int] = None
 
+    # Unfused attention: count intermediate tensors (logits, softmax, gather buffers)
+    # that fused kernels (flash attention, fused gate) would avoid materializing
+    unfused_attn: bool = False
+
     def __post_init__(self):
         self.nope_head_dim = self.head_dim - self.qk_rope_head_dim
         if self.recompute_modules is None:
@@ -330,6 +334,16 @@ class DSV4Compressor(MemEstimator):
         ret += bs * self.head_dim  # compressed KV
         # norm output
         ret += bs * self.head_dim
+
+        # Unfused: gate sigmoid and gated product must be materialized
+        if self.config.unfused_attn:
+            # sigmoid(wgate_output): same size as wgate output
+            ret += bs * self.coff * self.head_dim
+            # wkv * sigmoid(wgate): element-wise product, same size
+            ret += bs * self.coff * self.head_dim
+            # Segment softmax over ratio dimension: B * (S/ratio) * ratio
+            ret += bs  # S = (S/ratio) * ratio
+
         return ret
 
     def mock_forward(self, input_shape: list[int]):
@@ -386,12 +400,31 @@ class DSV4Indexer(MemEstimator):
         input_shape: [B, S, H]
         """
         ret = 0
+        bs = cum_mul(input_shape[:-1])
+        tp = get_tensor_model_parallel_world_size()
+
         # wq_b output: B * S * (index_n_heads * index_head_dim / TP)
         ret += self.wq_b.num_activation(input_shape)
         # weights_proj output: B * S * (index_n_heads / TP)
         ret += self.weights_proj.num_activation(input_shape)
         # Compressor activations
         ret += self.compressor.num_activation(input_shape)
+
+        if self.config.unfused_attn:
+            # Indexer attention logits: B * (index_n_heads/TP) * S * compressed_len
+            # Count at full S; CP division applied uniformly at report level
+            total_seq = input_shape[1] if len(input_shape) > 1 else input_shape[0]
+            compressed_len = total_seq // self.compress_ratio
+            idx_heads_tp = self.config.index_n_heads // tp
+            # bs = B * S (full sequence), after /cp gives B * (S/cp)
+            idx_logits = bs * idx_heads_tp * compressed_len
+            ret += idx_logits   # attention logits (Q * K^T)
+            ret += idx_logits   # softmax output
+
+            # Top-k selection results
+            ret += bs * self.config.index_topk       # scores (bf16)
+            ret += bs * self.config.index_topk       # indices (counted as bf16 equiv)
+
         return ret
 
     def mock_forward(self, input_shape: list[int]):
@@ -565,21 +598,39 @@ class DSV4Attention(MemEstimator):
             ret += self.indexer.num_activation(input_shape)
 
         # --- Core attention ---
-        # Flash attention: B * S * n_heads_per_partition * num_kv_tokens
-        # For window: num_kv_tokens = window_size
-        # For CSA/HCA: num_kv_tokens = window_size + S/compress_ratio (after CP all-gather)
+        # num_kv: number of KV tokens the main attention attends to
+        # Window: window_size only
+        # CSA: window_size + topk (sparse selection via indexer)
+        # HCA: window_size + total_seq/compress_ratio (dense attention on all compressed KV)
         if not self.checkpoint_core_attention:
-            # Simplified: B * S * n_heads_per_partition * (window_size + compressed_kv)
-            # This is an approximation; real flash attention doesn't materialize this
-            cp = self.config.cp_size
-            s_local = input_shape[1] // cp if len(input_shape) > 1 else input_shape[0] // cp
+            total_seq = input_shape[1] if len(input_shape) > 1 else input_shape[0]
             num_kv = self.config.window_size
-            if not self.is_window and self.compress_ratio > 0:
-                # Compressed KV: total_seq / compress_ratio (after CP all-gather)
-                total_seq = input_shape[1] if len(input_shape) > 1 else input_shape[0]
+            if self.is_csa:
+                # CSA: only attend to window + top-k selected compressed KV
+                num_kv += self.config.index_topk
+            elif self.is_hca:
+                # HCA: attend to all compressed KV tokens
                 num_kv += total_seq // self.compress_ratio
+
             # Attention output: B * S * n_heads_per_partition * head_dim
             ret += bs * self.n_heads_per_partition * self.config.head_dim
+
+            # Unfused: materialize attention logits, softmax, and gathered KV buffer
+            # Count at full S; CP division is applied uniformly at the report level
+            if self.config.unfused_attn:
+                # Attention logits: B * n_heads_tp * S * num_kv
+                # After /cp: B * n_heads_tp * (S/cp) * num_kv
+                attn_logits = bs * self.n_heads_per_partition * num_kv
+                ret += attn_logits  # Q * K^T logits
+                ret += attn_logits  # softmax output
+
+                # Gathered KV buffer for CSA: [B, S, window_size + topk, head_dim]
+                # After top-k selection, window KV + selected compressed KV are gathered
+                # into a contiguous buffer for the attention kernel.
+                # Fused kernels avoid materializing this; unfused must store it.
+                if self.is_csa:
+                    gathered_kv = bs * num_kv * self.config.head_dim
+                    ret += gathered_kv
 
         # --- Output path ---
         # wo_a: [B, S, n_heads*head_dim/o_groups] -> [B, S, o_groups*o_lora_rank/TP]
@@ -1179,7 +1230,7 @@ class DSV4Model(MemEstimator):
             ret += layer_act
 
         if layer_acts:
-            self._num_act_per_layer = layer_acts[0] if layer_acts else 0
+            self._num_act_per_layer = max(layer_acts)
             # Between-layer activation: only the hidden state tensor that must be
             # saved for recomputation during backward (not the full layer activation)
             from moe_mem_estimator.base import cum_mul

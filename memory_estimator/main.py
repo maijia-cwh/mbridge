@@ -90,6 +90,12 @@ class MBridgeEstimateConfig(BaseModel):
     # New field: custom pipeline-model-parallel layout
     pipeline_model_parallel_layout: Optional[str] = None  # Comma-separated ints
 
+    # Pipeline schedule
+    no_1f1b: bool = False  # Disable 1F1B, use all-forward-first schedule
+
+    # Unfused attention: count intermediate activation tensors
+    unfused_attn: bool = False
+
     @field_validator("num_gpus")
     def num_gpus_must_be_multiple_of_8(cls, v):
         if v <= 0 or v % 8 != 0:
@@ -153,6 +159,8 @@ async def estimate_with_mbridge(config: MBridgeEstimateConfig):
                 recompute_modules=config.recompute_modules or [],
                 num_layers_in_first_pipeline_stage=config.num_layers_in_first_pipeline_stage,
                 num_layers_in_last_pipeline_stage=config.num_layers_in_last_pipeline_stage,
+                no_1f1b=config.no_1f1b,
+                unfused_attn=config.unfused_attn,
             )
             processed_reports = []
             for rpt in aggregated_reports:
